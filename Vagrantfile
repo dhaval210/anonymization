@@ -14,6 +14,27 @@ $pg16_script = <<SCRIPT
   export PATH="/usr/pgsql-16/bin:$PATH"
 SCRIPT
 
+$pg15dev_script = <<SCRIPT
+  apt-get update
+  apt-get install -y git make gcc libreadline-dev zlib1g-dev bison flex libssl-dev
+  git clone --depth=1 -b REL_15_STABLE https://github.com/postgres/postgres.git
+  cd postgres
+  ./configure --enable-cassert --enable-debug --with-ssl=openssl
+  make
+  make all
+  make world-bin
+  make install-world-bin
+  cat >> /etc/profile.d/postgres.sh << \EOF
+  PATH=$PATH:/usr/local/pgsql/bin
+  EOF
+  adduser --system postgres
+  mkdir -p /usr/local/pgsql/data
+  chown postgres: /usr/local/pgsql/data
+  su postgres -c '/usr/local/pgsql/bin/initdb -D /usr/local/pgsql/data'
+  su postgres -c '/usr/local/pgsql/bin/pg_ctl -D /usr/local/pgsql/data -l /home/postgres/logfile start'
+
+
+SCRIPT
 
 Vagrant.configure("2") do |config|
 
@@ -31,5 +52,11 @@ Vagrant.configure("2") do |config|
     pg16.vm.provision "shell", inline: $pg16_script
   end
 
+  config.vm.define "pg15dev" do |pg15dev|
+    pg15dev.vm.box = "ubuntu/jammy64"
+    pg15dev.vm.hostname = "pg15dev"
+    pg15dev.vm.network :forwarded_port, guest: 5432, host: 54315
+    pg15dev.vm.provision "shell", inline: $pg15dev_script
+  end
 end
 
