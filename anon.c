@@ -635,16 +635,26 @@ pa_table_has_mask_in_policy(Oid relid, char *policy)
   char *        seclabel = NULL;
   int           i;
 
-  //Assert(relid>0);
-  Assert(policy);
+  if ( relid == 0) return false;
+  if ( ! policy )  return false;
+
+  rel = relation_open(relid, AccessShareLock);
+
+  if (RelationGetNamespace(rel) == PG_CATALOG_NAMESPACE )
+  {
+    relation_close(rel, NoLock);
+    return false;
+  }
 
   ObjectAddressSet(relationObject, RelationRelationId, relid);
   seclabel = GetSecurityLabel(&relationObject, policy);
-  ereport(NOTICE, (errmsg_internal("relation %i seclabel = %s",relid,seclabel)));
+  //ereport(NOTICE, (errmsg_internal("relation %i seclabel = %s",relid,seclabel)));
 
-  if (seclabel) return true;
+  if (seclabel) {
+    relation_close(rel, NoLock);
+    return true;
+  }
 
-  rel = relation_open(relid, AccessShareLock);
   reldesc = RelationGetDescr(rel);
 
   for (i = 0; i < reldesc->natts; i++)
@@ -658,8 +668,13 @@ pa_table_has_mask_in_policy(Oid relid, char *policy)
     ObjectAddressSubSet(columnobject, RelationRelationId, relid, a->attnum);
     seclabel = GetSecurityLabel(&columnobject, policy);
 
-    if (seclabel) return true;
+    if (seclabel) {
+      relation_close(rel, NoLock);
+      return true;
+    }
   }
+
+  relation_close(rel, NoLock);
   return false;
 }
 
@@ -784,16 +799,37 @@ pa_ProcessUtility_hook(PlannedStmt *pstmt,
 {
   char * policy = NULL;
 
-  ereport(NOTICE,errmsg_internal("copy hook"));
+  if (IsTransactionState()) {
 
-  policy = pa_get_masking_policy(GetUserId());
-  if ( guc_anon_transparent_dynamic_masking && policy)
-    pa_rewrite_utility(pstmt,policy);
+    policy = pa_get_masking_policy(GetUserId());
+    if ( guc_anon_transparent_dynamic_masking && policy)
+    {
+      PG_TRY();
+      {
+        pa_rewrite_utility(pstmt,policy);
+      }
+      PG_CATCH();
+      {
+        PG_RE_THROW();
+      }
+      PG_END_TRY();
+    }
+  }
 
-  if (prev_ProcessUtility_hook)
-    prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
-  else
-    standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+  PG_TRY();
+  {
+    if (prev_ProcessUtility_hook)
+      prev_ProcessUtility_hook(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+    else {
+      standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+    }
+  }
+  PG_CATCH();
+  {
+    PG_RE_THROW();
+  }
+  PG_END_TRY();
+
 }
 
 static void
@@ -805,32 +841,22 @@ pa_rewrite_utility(PlannedStmt *pstmt, char * policy)
   Assert(IsA(pstmt, PlannedStmt));
   Assert(pstmt->commandType == CMD_UTILITY);
 
-/*
-  readonly_flags = ClassifyUtilityCommandAsReadOnly(parsetree);
-  if (readonly_flags != COMMAND_IS_STRICTLY_READ_ONLY)
+  if ( IsA(parsetree, ExplainStmt)
+    || IsA(parsetree, TruncateStmt)
+  )
   {
     ereport(ERROR,
             ( errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
               errmsg("role \"%s\" is masked",
-                     GetUserNameFromId(GetUserId(), false))));
-  }
-*/
-  ereport(NOTICE,errmsg_internal("pa_rewrite_utility"));
-
-  if (IsA(parsetree, ExplainStmt))
-  {
-    ereport(ERROR,
-            ( errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-              errmsg("role \"%s\" is masked",
-                     GetUserNameFromId(GetUserId(), false))));
+                     GetUserNameFromId(GetUserId(), false)),
+              errdetail("Masked roles are read-only.")
+            ));
   }
 
   if (IsA(parsetree, CopyStmt))
   {
     /* https://doxygen.postgresql.org/structCopyStmt.html */
     CopyStmt   * copystmt = (CopyStmt *) parsetree;
-
-  ereport(NOTICE,errmsg_internal("copystmt"));
 
     if (! copystmt->is_from)
     {
@@ -840,9 +866,7 @@ pa_rewrite_utility(PlannedStmt *pstmt, char * policy)
       relid=RangeVarGetRelid(copystmt->relation,AccessShareLock,false);
       copystmt->relation = NULL;
       copystmt->attlist = NULL;
-  ereport(NOTICE,errmsg_internal("relid=RangeVarGetRelid"));
       copystmt->query=pa_masking_stmt_for_table(relid,policy);
-  ereport(NOTICE,errmsg_internal("query=pa_masking_stmt_for_table"));
     }
   }
 }
@@ -869,7 +893,7 @@ pa_rewrite(Query * query, char * policy)
     masking_query = pa_masking_query_for_table(e->relid, policy);
     if(masking_query)
     {
-      ereport(NOTICE, (errmsg_internal("trying to mask relation %d", e->relid)));
+      //ereport(NOTICE, (errmsg_internal("trying to mask relation %d", e->relid)));
       e->rtekind = RTE_SUBQUERY;
       e->subquery = masking_query;
     }
@@ -1021,14 +1045,7 @@ pa_masking_query_for_table(Oid relid, char * policy)
                     get_rel_name(relid)
   );
 
-  ereport(NOTICE, (errmsg_internal("masking_query = %s", query_string.data)));
-
-  #if PG_VERSION_NUM >= 140000
-  raw_parsetree_list = raw_parser(query_string.data,RAW_PARSE_DEFAULT);
-  #else
-  raw_parsetree_list = raw_parser(query_string.data);
-  #endif
-
+  raw_parsetree_list = pg_parse_query(query_string.data);
   stmt = linitial_node(RawStmt, raw_parsetree_list);
 
   /*
@@ -1045,7 +1062,7 @@ pa_masking_query_for_table(Oid relid, char * policy)
 
 /*
  * pa_masking_stmt_for_table
- *  prepare a Raw Statment object that will replace the authentic relation
+ *  prepare a Raw Statement object that will replace the authentic relation
  *
  */
 Node *
@@ -1064,16 +1081,8 @@ pa_masking_stmt_for_table(Oid relid, char * policy)
                     get_rel_name(relid)
   );
 
-  ereport(NOTICE, (errmsg_internal("masking_query = %s", query_string.data)));
-
-  #if PG_VERSION_NUM >= 140000
-  raw_parsetree_list = raw_parser(query_string.data,RAW_PARSE_DEFAULT);
-  #else
-  raw_parsetree_list = raw_parser(query_string.data);
-  #endif
-
-  return (Node *) linitial_node(RawStmt, raw_parsetree_list);
-
+  raw_parsetree_list = pg_parse_query(query_string.data);
+  return (Node *) linitial_node(RawStmt, raw_parsetree_list)->stmt;
 }
 
 /*
@@ -1110,4 +1119,3 @@ anon_masking_value_for_column(PG_FUNCTION_ARGS)
   PG_RETURN_TEXT_P(cstring_to_text(masking_value.data));
 }
 
-//ereport(NOTICE, (errmsg_internal("")));

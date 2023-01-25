@@ -22,8 +22,10 @@ $pg15dev_script = <<SCRIPT
   ./configure --enable-cassert --enable-debug --with-ssl=openssl
   make
   make all
+  make -C contrib/pgcrypto
   make world-bin
   make install-world-bin
+  make -C contrib/pgcrypto install
   cat >> /etc/profile.d/postgres.sh << \EOF
   PATH=$PATH:/usr/local/pgsql/bin
   EOF
